@@ -12,14 +12,16 @@ import cats.effect._
 import cats.implicits._
 import java.net.InetSocketAddress
 import java.util
+
+import cats.Applicative
 import javax.net.ssl.{SSLContext, SSLParameters}
 import javax.servlet.{DispatcherType, Filter}
 import javax.servlet.http.HttpServlet
 import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
 import org.eclipse.jetty.server.{
-  ServerConnector,
   HttpConfiguration,
   HttpConnectionFactory,
+  ServerConnector,
   Server => JServer
 }
 import org.eclipse.jetty.server.handler.StatisticsHandler
@@ -32,6 +34,7 @@ import org.http4s.server.jetty.JettyBuilder._
 import org.http4s.servlet.{AsyncHttp4sServlet, ServletContainer, ServletIo}
 import org.http4s.syntax.all._
 import org.log4s.getLogger
+
 import scala.collection.immutable
 import scala.concurrent.duration._
 
@@ -46,7 +49,8 @@ sealed class JettyBuilder[F[_]] private (
     mounts: Vector[Mount[F]],
     private val serviceErrorHandler: ServiceErrorHandler[F],
     supportHttp2: Boolean,
-    banner: immutable.Seq[String]
+    banner: immutable.Seq[String],
+    private val modifyJettyServer: JServer => F[Unit]
 )(implicit protected val F: ConcurrentEffect[F])
     extends ServletContainer[F]
     with ServerBuilder[F] {
@@ -78,7 +82,8 @@ sealed class JettyBuilder[F[_]] private (
       mounts = mounts,
       serviceErrorHandler = serviceErrorHandler,
       supportHttp2 = false,
-      banner = banner
+      banner = banner,
+      modifyJettyServer = _ => F.unit
     )
 
   private def copy(
@@ -92,7 +97,8 @@ sealed class JettyBuilder[F[_]] private (
       mounts: Vector[Mount[F]] = mounts,
       serviceErrorHandler: ServiceErrorHandler[F] = serviceErrorHandler,
       supportHttp2: Boolean = supportHttp2,
-      banner: immutable.Seq[String] = banner
+      banner: immutable.Seq[String] = banner,
+      modifyJettyServer: JServer => F[Unit] = modifyJettyServer
   ): Self =
     new JettyBuilder(
       socketAddress,
@@ -105,7 +111,8 @@ sealed class JettyBuilder[F[_]] private (
       mounts,
       serviceErrorHandler,
       supportHttp2,
-      banner)
+      banner,
+      modifyJettyServer)
 
   @deprecated(
     "Build an `SSLContext` from the first four parameters and use `withSslContext` (note lowercase). To also request client certificates, use `withSslContextAndParameters, calling either `.setWantClientAuth(true)` or `setNeedClientAuth(true)` on the `SSLParameters`.",
@@ -218,6 +225,10 @@ sealed class JettyBuilder[F[_]] private (
   def withBanner(banner: immutable.Seq[String]): Self =
     copy(banner = banner)
 
+  /** Apply an arbitrary modification to the underlying [[JServer]]. Applied before the server starts. */
+  def withJettyServerModification(modification: JServer => F[Unit]): Self =
+    copy(modifyJettyServer = modification)
+
   private def getConnector(jetty: JServer): ServerConnector =
     sslConfig.makeSslContextFactory match {
       case Some(sslContextFactory) =>
@@ -235,52 +246,60 @@ sealed class JettyBuilder[F[_]] private (
     }
 
   def resource: Resource[F, Server] =
-    Resource(F.delay {
-      val jetty = new JServer(threadPool)
+    Resource(
+      for {
+        jetty <- F.delay {
+          val jetty = new JServer(threadPool)
 
-      val context = new ServletContextHandler()
-      context.setContextPath("/")
+          val context = new ServletContextHandler()
+          context.setContextPath("/")
 
-      jetty.setHandler(context)
+          jetty.setHandler(context)
 
-      val connector = getConnector(jetty)
+          val connector = getConnector(jetty)
 
-      connector.setHost(socketAddress.getHostString)
-      connector.setPort(socketAddress.getPort)
-      connector.setIdleTimeout(if (idleTimeout.isFinite) idleTimeout.toMillis else -1)
-      jetty.addConnector(connector)
+          connector.setHost(socketAddress.getHostString)
+          connector.setPort(socketAddress.getPort)
+          connector.setIdleTimeout(if (idleTimeout.isFinite) idleTimeout.toMillis else -1)
+          jetty.addConnector(connector)
 
-      // Jetty graceful shutdown does not work without a stats handler
-      val stats = new StatisticsHandler
-      stats.setHandler(jetty.getHandler)
-      jetty.setHandler(stats)
+          // Jetty graceful shutdown does not work without a stats handler
+          val stats = new StatisticsHandler
+          stats.setHandler(jetty.getHandler)
+          jetty.setHandler(stats)
 
-      jetty.setStopTimeout(shutdownTimeout match {
-        case d: FiniteDuration => d.toMillis
-        case _ => 0L
-      })
+          jetty.setStopTimeout(shutdownTimeout match {
+            case d: FiniteDuration => d.toMillis
+            case _ => 0L
+          })
 
-      for ((mount, i) <- mounts.zipWithIndex)
-        mount.f(context, i, this)
+          for ((mount, i) <- mounts.zipWithIndex)
+            mount.f(context, i, this)
 
-      jetty.start()
-
-      val server = new Server {
-        lazy val address: InetSocketAddress = {
-          val host = socketAddress.getHostString
-          val port = jetty.getConnectors()(0).asInstanceOf[ServerConnector].getLocalPort
-          new InetSocketAddress(host, port)
+          jetty
         }
+        _ <- modifyJettyServer(jetty)
+        server <- F.delay {
+          jetty.start()
 
-        lazy val isSecure: Boolean = sslConfig.isSecure
-      }
+          val server = new Server {
+            lazy val address: InetSocketAddress = {
+              val host = socketAddress.getHostString
+              val port = jetty.getConnectors()(0).asInstanceOf[ServerConnector].getLocalPort
+              new InetSocketAddress(host, port)
+            }
 
-      banner.foreach(logger.info(_))
-      logger.info(
-        s"http4s v${BuildInfo.version} on Jetty v${JServer.getVersion} started at ${server.baseUri}")
+            lazy val isSecure: Boolean = sslConfig.isSecure
+          }
 
-      server -> shutdown(jetty)
-    })
+          banner.foreach(logger.info(_))
+          logger.info(
+            s"http4s v${BuildInfo.version} on Jetty v${JServer.getVersion} started at ${server.baseUri}")
+
+          server
+        }
+      } yield server -> shutdown(jetty)
+    )
 
   private def shutdown(jetty: JServer): F[Unit] =
     F.async[Unit] { cb =>
@@ -307,7 +326,8 @@ object JettyBuilder {
       mounts = Vector.empty,
       serviceErrorHandler = DefaultServiceErrorHandler,
       supportHttp2 = false,
-      banner = defaults.Banner
+      banner = defaults.Banner,
+      modifyJettyServer = _ => Applicative[F].unit
     )
 
   private sealed trait SslConfig {
